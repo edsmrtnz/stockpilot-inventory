@@ -17,7 +17,7 @@ React, TypeScript, Tailwind CSS, Lucide React, and vinext.
 
 ## Live demo
 
-https://stockpilot-inventory-demo.edsmartiinez.chatgpt.site
+https://edsmrtnz.github.io/stockpilot-inventory/
 
 ## Run locally
 
