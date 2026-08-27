@@ -2,6 +2,7 @@
 
 import { AlertTriangle, ArrowDownRight, ArrowUpRight, Boxes, ChartNoAxesCombined, Check, ChevronDown, CircleDollarSign, ClipboardList, Eye, EyeOff, Filter, LogOut, Menu, Minus, PackageCheck, Plus, Search, Settings, ShoppingCart, Trash2, TrendingUp, X } from 'lucide-react';
 import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { supabase } from '../src/lib/supabase';
 
 type View = 'overview' | 'products' | 'orders' | 'settings';
 type Product = { id: number; name: string; sku: string; category: string; stock: number; reorder: number; price: number; status: 'Active' | 'Draft' };
@@ -15,7 +16,7 @@ const initialProducts: Product[] = [
   { id: 5, name: 'NVMe SSD 1TB', sku: 'SSD-NVME-1T', category: 'Components', stock: 64, reorder: 15, price: 84, status: 'Active' },
   { id: 6, name: '1080p Conference Webcam', sku: 'CAM-HD-1080', category: 'Peripherals', stock: 0, reorder: 8, price: 72, status: 'Draft' },
 ];
-const orders: Order[] = [
+const initialOrders: Order[] = [
   { id: 'ORD-1048', customer: 'Northstar Studio', items: 5, total: 842, status: 'Processing', date: 'Aug 27, 2026' },
   { id: 'ORD-1047', customer: 'Mira Technologies', items: 2, total: 658, status: 'Shipped', date: 'Aug 27, 2026' },
   { id: 'ORD-1046', customer: 'Cedar & Co.', items: 8, total: 1294, status: 'Delivered', date: 'Aug 26, 2026' },
@@ -28,17 +29,39 @@ export default function Home() {
   const [view, setView] = useState<View>('overview');
   const [mobileNav, setMobileNav] = useState(false);
   const [products, setProducts] = useState<Product[]>(initialProducts);
+  const [orderData, setOrderData] = useState<Order[]>(initialOrders);
+  const [databaseReady, setDatabaseReady] = useState(false);
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState('All categories');
   const [modal, setModal] = useState(false);
   const [editing, setEditing] = useState<Product | null>(null);
 
   useEffect(() => {
-    const saved = localStorage.getItem('stockpilot-products');
-    if (saved) setProducts(JSON.parse(saved) as Product[]);
     setAuthenticated(localStorage.getItem('stockpilot-session') === 'active');
+    void connectDatabase();
   }, []);
-  useEffect(() => { localStorage.setItem('stockpilot-products', JSON.stringify(products)); }, [products]);
+
+  async function connectDatabase() {
+    let { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      const result = await supabase.auth.signInAnonymously();
+      session = result.data.session;
+    }
+    if (!session) return;
+    let { data: rows } = await supabase.from('products').select('*').order('id');
+    if (!rows?.length) {
+      await supabase.from('products').insert(initialProducts.map(({id,reorder,...p})=>({...p,reorder_level:reorder})));
+      rows = (await supabase.from('products').select('*').order('id')).data;
+    }
+    if (rows) setProducts(rows.map(row=>({id:row.id,name:row.name,sku:row.sku,category:row.category,stock:row.stock,reorder:row.reorder_level,price:Number(row.price),status:row.status as Product['status']})));
+    let { data: orderRows } = await supabase.from('orders').select('*').order('id');
+    if (!orderRows?.length) {
+      await supabase.from('orders').insert(initialOrders.map(o=>({order_number:o.id,customer_name:o.customer,item_count:o.items,total:o.total,status:o.status,created_at:new Date(o.date).toISOString()})));
+      orderRows = (await supabase.from('orders').select('*').order('id')).data;
+    }
+    if(orderRows) setOrderData(orderRows.map(row=>({id:row.order_number,customer:row.customer_name,items:row.item_count,total:Number(row.total),status:row.status as Order['status'],date:new Date(row.created_at).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})})));
+    setDatabaseReady(true);
+  }
 
   const filtered = useMemo(() => products.filter(p => (category === 'All categories' || p.category === category) && `${p.name} ${p.sku}`.toLowerCase().includes(search.toLowerCase())), [products, search, category]);
   const inventoryValue = products.reduce((sum, p) => sum + p.stock * p.price, 0);
@@ -48,15 +71,22 @@ export default function Home() {
   function logout() { localStorage.removeItem('stockpilot-session'); setAuthenticated(false); setView('overview'); }
   function changeView(next: View) { setView(next); setMobileNav(false); }
   function openProduct(product?: Product) { setEditing(product ?? null); setModal(true); }
-  function saveProduct(e: FormEvent<HTMLFormElement>) {
+  async function saveProduct(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const d = new FormData(e.currentTarget);
     const value: Product = { id: editing?.id ?? Date.now(), name: String(d.get('name')), sku: String(d.get('sku')), category: String(d.get('category')), stock: Number(d.get('stock')), reorder: Number(d.get('reorder')), price: Number(d.get('price')), status: String(d.get('status')) as Product['status'] };
-    setProducts(current => editing ? current.map(p => p.id === editing.id ? value : p) : [value, ...current]);
+    const record={name:value.name,sku:value.sku,category:value.category,stock:value.stock,reorder_level:value.reorder,price:value.price,status:value.status};
+    if(editing) {
+      await supabase.from('products').update(record).eq('id',editing.id);
+      setProducts(current => current.map(p => p.id === editing.id ? {...value,id:editing.id} : p));
+    } else {
+      const {data}=await supabase.from('products').insert(record).select().single();
+      if(data) setProducts(current => [{...value,id:data.id}, ...current]);
+    }
     setModal(false);
   }
-  function adjustStock(id: number, amount: number) { setProducts(current => current.map(p => p.id === id ? { ...p, stock: Math.max(0, p.stock + amount) } : p)); }
-  function deleteProduct(id: number) { setProducts(current => current.filter(p => p.id !== id)); }
+  function adjustStock(id: number, amount: number) { setProducts(current => current.map(p => { if(p.id!==id)return p; const stock=Math.max(0,p.stock+amount); void supabase.from('products').update({stock}).eq('id',id); return {...p,stock}; })); }
+  function deleteProduct(id: number) { void supabase.from('products').delete().eq('id',id); setProducts(current => current.filter(p => p.id !== id)); }
 
   if (!authenticated) return <Login onSubmit={login} showPassword={showPassword} setShowPassword={setShowPassword} />;
 
@@ -65,11 +95,11 @@ export default function Home() {
     <div className="lg:pl-64">
       <header className="sticky top-0 z-20 flex h-20 items-center justify-between border-b border-[#dfe4dd] bg-white/90 px-4 backdrop-blur-xl sm:px-8">
         <div className="flex items-center gap-3"><button onClick={() => setMobileNav(true)} className="rounded-xl border border-[#dfe4dd] p-2.5 lg:hidden" aria-label="Open menu"><Menu size={20}/></button><div><p className="hidden text-[10px] font-bold uppercase tracking-[.18em] text-[#66806d] sm:block">Wednesday, August 27</p><h1 className="text-lg font-bold sm:text-xl">Good afternoon, Edison</h1></div></div>
-        <div className="flex items-center gap-3"><div className="hidden text-right sm:block"><p className="text-sm font-semibold">Edison Martinez</p><p className="text-xs text-[#66806d]">Administrator</p></div><div className="grid h-10 w-10 place-items-center rounded-full bg-[#13251b] text-xs font-bold text-[#c8f45d]">EM</div></div>
+        <div className="flex items-center gap-3"><span className={`hidden rounded-full px-3 py-1 text-xs font-semibold sm:inline ${databaseReady?'bg-[#edf4e8] text-[#5f7d3d]':'bg-[#fff0e3] text-[#b86629]'}`}>{databaseReady?'PostgreSQL connected':'Connecting…'}</span><div className="hidden text-right sm:block"><p className="text-sm font-semibold">Edison Martinez</p><p className="text-xs text-[#66806d]">Administrator</p></div><div className="grid h-10 w-10 place-items-center rounded-full bg-[#13251b] text-xs font-bold text-[#c8f45d]">EM</div></div>
       </header>
       {view === 'overview' && <Overview products={products} inventoryValue={inventoryValue} lowStock={lowStock} onAdd={() => openProduct()} onView={changeView} />}
       {view === 'products' && <Products products={filtered} search={search} setSearch={setSearch} category={category} setCategory={setCategory} onAdd={() => openProduct()} onEdit={openProduct} onAdjust={adjustStock} onDelete={deleteProduct} />}
-      {view === 'orders' && <Orders />}
+      {view === 'orders' && <Orders orders={orderData} />}
       {view === 'settings' && <SettingsPanel />}
     </div>
     {modal && <ProductModal product={editing} onClose={() => setModal(false)} onSave={saveProduct} />}
@@ -102,7 +132,7 @@ function Products({ products, search, setSearch, category, setCategory, onAdd, o
   return <section className="mx-auto max-w-7xl p-4 sm:p-8"><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-[#66806d]">Catalog & stock control</p><h2 className="mt-1 text-3xl font-bold tracking-tight">Products</h2></div><button onClick={onAdd} className="flex items-center justify-center gap-2 rounded-xl bg-[#13251b] px-5 py-3 text-sm font-semibold text-white"><Plus size={17}/>Add product</button></div><div className="mt-8 flex flex-col gap-3 rounded-2xl border border-[#dfe4dd] bg-white p-4 sm:flex-row"><label className="relative flex-1"><Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#7b8a80]" size={18}/><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search by product name or SKU..." className="w-full rounded-xl border border-[#dfe4dd] py-3 pl-10 pr-4 outline-none focus:border-[#74913a]"/></label><label className="relative"><Filter className="absolute left-3 top-1/2 -translate-y-1/2 text-[#7b8a80]" size={16}/><select value={category} onChange={e=>setCategory(e.target.value)} className="w-full appearance-none rounded-xl border border-[#dfe4dd] bg-white py-3 pl-10 pr-10 text-sm outline-none sm:w-52">{categories.map(c=><option key={c}>{c}</option>)}</select><ChevronDown className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[#7b8a80]" size={16}/></label></div><div className="mt-4 overflow-hidden rounded-2xl border border-[#dfe4dd] bg-white"><div className="hidden grid-cols-[2fr_1fr_.7fr_.8fr_130px] border-b border-[#e5e9e3] bg-[#f8f9f7] px-5 py-3 text-[11px] font-bold uppercase tracking-[.12em] text-[#728076] md:grid"><span>Product</span><span>Category</span><span>Stock</span><span>Price</span><span className="text-right">Actions</span></div><div className="divide-y divide-[#edf0ec]">{products.map(p=><div key={p.id} className="grid gap-3 p-4 md:grid-cols-[2fr_1fr_.7fr_.8fr_130px] md:items-center md:px-5"><div className="flex items-center gap-3"><span className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-[#eef4e9] text-[#54743f]"><PackageCheck size={20}/></span><div className="min-w-0"><p className="truncate font-semibold">{p.name}</p><p className="text-xs text-[#7b8a80]">{p.sku} · <span className={p.status==='Active'?'text-[#64843e]':'text-[#a27a35]'}>{p.status}</span></p></div></div><p className="text-sm text-[#617069]"><span className="md:hidden">Category: </span>{p.category}</p><div><span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${p.stock===0?'bg-[#ffe9e5] text-[#c64732]':p.stock<=p.reorder?'bg-[#fff0e3] text-[#c56b28]':'bg-[#edf4e8] text-[#5f7d3d]'}`}>{p.stock} units</span></div><p className="font-semibold">{money(p.price)}</p><div className="flex justify-end gap-1"><button onClick={()=>onAdjust(p.id,-1)} aria-label="Decrease stock" className="rounded-lg border border-[#dfe4dd] p-2 text-[#69766d] hover:bg-[#f1f4ef]"><Minus size={15}/></button><button onClick={()=>onAdjust(p.id,1)} aria-label="Increase stock" className="rounded-lg border border-[#dfe4dd] p-2 text-[#69766d] hover:bg-[#f1f4ef]"><Plus size={15}/></button><button onClick={()=>onEdit(p)} aria-label="Edit product" className="rounded-lg border border-[#dfe4dd] p-2 text-[#69766d] hover:bg-[#f1f4ef]"><ClipboardList size={15}/></button><button onClick={()=>onDelete(p.id)} aria-label="Delete product" className="rounded-lg p-2 text-[#bd5b4b] hover:bg-[#fff0ed]"><Trash2 size={15}/></button></div></div>)}{products.length===0&&<div className="p-12 text-center text-[#7b8a80]">No products match your filters.</div>}</div></div></section>;
 }
 
-function Orders() {
+function Orders({orders}:{orders:Order[]}) {
   return <section className="mx-auto max-w-7xl p-4 sm:p-8"><div><p className="text-sm text-[#66806d]">Sales fulfillment</p><h2 className="mt-1 text-3xl font-bold tracking-tight">Orders</h2></div><div className="mt-8 grid gap-4 sm:grid-cols-3">{[['Processing','12','Ready to pack'],['Shipped','18','In transit'],['Delivered','146','This month']].map(([a,b,c])=><div key={a} className="rounded-2xl border border-[#dfe4dd] bg-white p-5"><p className="text-sm text-[#66806d]">{a}</p><p className="mt-3 text-3xl font-bold">{b}</p><p className="mt-1 text-xs text-[#7b8a80]">{c}</p></div>)}</div><div className="mt-6 overflow-hidden rounded-2xl border border-[#dfe4dd] bg-white"><div className="border-b border-[#e5e9e3] p-5"><h3 className="font-bold">Recent orders</h3><p className="text-sm text-[#66806d]">Track current sales and fulfillment</p></div><div className="divide-y divide-[#edf0ec]">{orders.map(o=><div key={o.id} className="grid gap-3 p-5 sm:grid-cols-[.8fr_1.4fr_.5fr_.7fr_.8fr] sm:items-center"><p className="font-mono text-sm font-semibold">{o.id}</p><div><p className="font-semibold">{o.customer}</p><p className="text-xs text-[#7b8a80]">{o.date}</p></div><p className="text-sm">{o.items} items</p><p className="font-semibold">{money(o.total)}</p><div><span className={`rounded-full px-3 py-1.5 text-xs font-semibold ${o.status==='Delivered'?'bg-[#edf4e8] text-[#5f7d3d]':o.status==='Shipped'?'bg-[#e9f1fa] text-[#3f6e9b]':'bg-[#fff0e3] text-[#b86629]'}`}>{o.status}</span></div></div>)}</div></div></section>;
 }
 
@@ -113,8 +143,17 @@ function SettingsPanel() {
   const [prefs,setPrefs] = useState<Preferences>(defaultPreferences);
   const [saved,setSaved] = useState(false);
   const [active,setActive] = useState('security');
-  useEffect(()=>{ const value=localStorage.getItem('stockpilot-settings'); if(value) setPrefs(JSON.parse(value) as Preferences); },[]);
-  function save(){ localStorage.setItem('stockpilot-settings',JSON.stringify(prefs)); setSaved(true); setTimeout(()=>setSaved(false),1800); }
+  useEffect(()=>{ void loadPreferences(); },[]);
+  async function loadPreferences(){
+    const {data}=await supabase.from('user_preferences').select('*').maybeSingle();
+    if(data) setPrefs({currency:data.currency,units:data.units,theme:data.theme,lowStock:data.low_stock_enabled,lowStockLevel:data.low_stock_level,skuPrefix:data.sku_prefix,skuAuto:data.sku_auto,emailOrders:data.email_orders,emailLowStock:data.email_low_stock,browserAlerts:data.browser_alerts,twoFactor:data.two_factor});
+  }
+  async function save(){
+    const {data:{user}}=await supabase.auth.getUser();
+    if(!user)return;
+    await supabase.from('user_preferences').upsert({user_id:user.id,currency:prefs.currency,units:prefs.units,theme:prefs.theme,low_stock_enabled:prefs.lowStock,low_stock_level:prefs.lowStockLevel,sku_prefix:prefs.skuPrefix,sku_auto:prefs.skuAuto,email_orders:prefs.emailOrders,email_low_stock:prefs.emailLowStock,browser_alerts:prefs.browserAlerts,two_factor:prefs.twoFactor,updated_at:new Date().toISOString()});
+    setSaved(true); setTimeout(()=>setSaved(false),1800);
+  }
   const sections=[['security','Account Security'],['general','General Preferences'],['inventory','Inventory Defaults'],['notifications','Notifications'],['users','User Management']];
   return <section className="mx-auto max-w-7xl p-4 sm:p-8"><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-sm text-[#66806d]">Workspace administration</p><h2 className="mt-1 text-3xl font-bold tracking-tight">Settings</h2></div><button onClick={save} className="flex items-center justify-center gap-2 rounded-xl bg-[#13251b] px-5 py-3 text-sm font-semibold text-white"><Check size={17}/>{saved?'Saved':'Save changes'}</button></div>
     <div className="mt-8 grid gap-6 lg:grid-cols-[240px_1fr]"><nav className="h-fit rounded-2xl border border-[#dfe4dd] bg-white p-2">{sections.map(([id,label],i)=><button key={id} onClick={()=>setActive(id)} className={`flex w-full items-center justify-between rounded-xl px-4 py-3 text-left text-sm ${active===id?'bg-[#13251b] font-semibold text-white':'text-[#617069] hover:bg-[#f2f5f0]'}`}><span>{label}</span>{i===4&&<span className="rounded-full bg-[#c8f45d] px-2 py-0.5 text-[9px] font-bold text-[#172018]">ADMIN</span>}</button>)}</nav>
